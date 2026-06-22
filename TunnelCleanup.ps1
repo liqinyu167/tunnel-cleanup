@@ -1,4 +1,5 @@
 param(
+  [switch]$DryRun,
   [switch]$NoStopProcesses,
   [switch]$NoRestartAdapter,
   [switch]$NoOpenPortal,
@@ -16,16 +17,21 @@ New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
 $log = Join-Path $LogDirectory 'tunnel-cleanup.log'
 $stateFile = Join-Path $LogDirectory 'last-proxy-state.json'
 
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  Start-Process -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) `
-    -Verb RunAs
-  exit
+if (-not $DryRun) {
+  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+      -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) `
+      -Verb RunAs
+    exit
+  }
 }
 
 Start-Transcript -Path $log -Append | Out-Null
 Write-Host "=== Tunnel cleanup started: $(Get-Date) ==="
+if ($DryRun) {
+  Write-Host 'Dry run mode: no proxy, route, process, adapter, or browser changes will be made.'
+}
 
 function Write-Step($message) {
   Write-Host ''
@@ -81,8 +87,12 @@ function Stop-UserTunnelProcesses {
       }
     } |
     ForEach-Object {
-      Write-Host "Stopping user tunnel/proxy process: $($_.ProcessName) [$($_.Id)]"
-      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+      if ($DryRun) {
+        Write-Host "Would stop user tunnel/proxy process: $($_.ProcessName) [$($_.Id)]"
+      } else {
+        Write-Host "Stopping user tunnel/proxy process: $($_.ProcessName) [$($_.Id)]"
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+      }
     }
 }
 
@@ -100,8 +110,12 @@ function Remove-TunnelDefaultRoutes {
       ($tunnelAliases -contains $_.InterfaceAlias)
     } |
     ForEach-Object {
-      Write-Host "Removing tunnel default route only: $($_.DestinationPrefix) via $($_.InterfaceAlias)"
-      Remove-NetRoute -DestinationPrefix $_.DestinationPrefix -InterfaceIndex $_.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+      if ($DryRun) {
+        Write-Host "Would remove tunnel default route only: $($_.DestinationPrefix) via $($_.InterfaceAlias)"
+      } else {
+        Write-Host "Removing tunnel default route only: $($_.DestinationPrefix) via $($_.InterfaceAlias)"
+        Remove-NetRoute -DestinationPrefix $_.DestinationPrefix -InterfaceIndex $_.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+      }
     }
 }
 
@@ -111,9 +125,14 @@ function Reset-ProxyState {
     Select-Object ProxyEnable, ProxyServer, ProxyOverride, AutoConfigURL
   $proxyState | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
 
-  Set-ItemProperty -Path $proxyPath -Name ProxyEnable -Type DWord -Value 0
-  Set-ItemProperty -Path $proxyPath -Name AutoConfigURL -Value ''
-  netsh winhttp reset proxy
+  if ($DryRun) {
+    Write-Host "Would disable user proxy at $proxyPath"
+    Write-Host 'Would reset WinHTTP proxy'
+  } else {
+    Set-ItemProperty -Path $proxyPath -Name ProxyEnable -Type DWord -Value 0
+    Set-ItemProperty -Path $proxyPath -Name AutoConfigURL -Value ''
+    netsh winhttp reset proxy
+  }
 }
 
 function Restart-PhysicalNetwork {
@@ -124,13 +143,18 @@ function Restart-PhysicalNetwork {
   }
 
   Write-Host "Selected physical adapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
-  Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 3
-  Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 8
+  if ($DryRun) {
+    Write-Host "Would restart physical adapter: $($adapter.Name)"
+    Write-Host "Would renew DHCP on adapter: $($adapter.Name)"
+  } else {
+    Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 8
 
-  ipconfig /release $adapter.Name
-  ipconfig /renew $adapter.Name
+    ipconfig /release $adapter.Name
+    ipconfig /renew $adapter.Name
+  }
 
   $adapter = Get-NetAdapter -Name $adapter.Name -ErrorAction SilentlyContinue
   $ipConfig = Get-NetIPConfiguration -InterfaceAlias $adapter.Name -ErrorAction SilentlyContinue
@@ -151,7 +175,11 @@ function Restart-PhysicalNetwork {
     if ($locationLine -and $locationLine -match '^\s*Location:\s*(.+)\s*$') {
       $portalUrl = $Matches[1].Trim()
       Write-Host "Detected captive portal: $portalUrl"
-      Start-Process $portalUrl
+      if ($DryRun) {
+        Write-Host "Would open captive portal: $portalUrl"
+      } else {
+        Start-Process $portalUrl
+      }
     } else {
       Write-Host 'No captive portal redirect was detected.'
     }
@@ -177,7 +205,11 @@ Get-TunnelLikeAdapters |
   Format-Table -AutoSize
 
 Write-Step 'Refreshing DNS'
-ipconfig /flushdns
+if ($DryRun) {
+  Write-Host 'Would flush DNS'
+} else {
+  ipconfig /flushdns
+}
 
 if (-not $NoRestartAdapter) {
   Write-Step 'Restarting primary physical adapter and renewing DHCP'
