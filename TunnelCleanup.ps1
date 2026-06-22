@@ -1,5 +1,9 @@
 param(
   [switch]$DryRun,
+  [switch]$StopProcesses,
+  [switch]$FlushDns,
+  [switch]$RestartAdapter,
+  [switch]$OpenPortal,
   [switch]$NoStopProcesses,
   [switch]$NoRestartAdapter,
   [switch]$NoOpenPortal,
@@ -17,20 +21,11 @@ New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
 $log = Join-Path $LogDirectory 'tunnel-cleanup.log'
 $stateFile = Join-Path $LogDirectory 'last-proxy-state.json'
 
-if (-not $DryRun) {
-  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-      -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) `
-      -Verb RunAs
-    exit
-  }
-}
-
 Start-Transcript -Path $log -Append | Out-Null
 Write-Host "=== Tunnel cleanup started: $(Get-Date) ==="
+Write-Host 'Mode: gentle cleanup. No adapter restart, no DHCP renew, no DNS flush, no driver changes.'
 if ($DryRun) {
-  Write-Host 'Dry run mode: no proxy, route, process, adapter, or browser changes will be made.'
+  Write-Host 'Dry run mode: no changes will be made.'
 }
 
 function Write-Step($message) {
@@ -38,23 +33,9 @@ function Write-Step($message) {
   Write-Host ">>> $message"
 }
 
-function Get-PrimaryPhysicalAdapter {
-  $upAdapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.Status -eq 'Up' -and
-      $_.InterfaceDescription -notmatch 'Virtual|Loopback|TAP|TUN|Tunnel|VPN|Wintun|WireGuard|Hyper-V|VirtualBox|VMware'
-    } |
-    Sort-Object InterfaceMetric, InterfaceIndex |
-    Select-Object -First 1
-
-  if ($upAdapter) { return $upAdapter }
-
-  return Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.InterfaceDescription -notmatch 'Virtual|Loopback|TAP|TUN|Tunnel|VPN|Wintun|WireGuard|Hyper-V|VirtualBox|VMware'
-    } |
-    Sort-Object InterfaceIndex |
-    Select-Object -First 1
+function Test-IsAdmin {
+  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Get-TunnelLikeAdapters {
@@ -63,6 +44,38 @@ function Get-TunnelLikeAdapters {
       $_.Name -match 'tun|tap|vpn|wireguard|wintun|meta|clash|mihomo|sing|tailscale|zerotier|openvpn' -or
       $_.InterfaceDescription -match 'tun|tap|vpn|wireguard|wintun|tunnel|meta|clash|mihomo|sing|tailscale|zerotier|openvpn'
     }
+}
+
+function Get-TunnelDefaultRoutes {
+  $tunnelAliases = @(Get-TunnelLikeAdapters | Select-Object -ExpandProperty Name)
+  if (-not $tunnelAliases -or $tunnelAliases.Count -eq 0) {
+    return @()
+  }
+
+  @(Get-NetRoute -ErrorAction SilentlyContinue |
+    Where-Object {
+      ($_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0') -and
+      ($tunnelAliases -contains $_.InterfaceAlias)
+    })
+}
+
+function Reset-ProxyState {
+  $proxyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+  $proxyState = Get-ItemProperty -Path $proxyPath |
+    Select-Object ProxyEnable, ProxyServer, ProxyOverride, AutoConfigURL
+  $proxyState | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
+
+  if ($DryRun) {
+    Write-Host "Would disable user proxy at $proxyPath"
+    Write-Host 'Would clear AutoConfigURL and ProxyServer.'
+    Write-Host 'Would reset WinHTTP proxy.'
+    return
+  }
+
+  Set-ItemProperty -Path $proxyPath -Name ProxyEnable -Type DWord -Value 0 -ErrorAction SilentlyContinue
+  Set-ItemProperty -Path $proxyPath -Name AutoConfigURL -Value '' -ErrorAction SilentlyContinue
+  Remove-ItemProperty -Path $proxyPath -Name ProxyServer -ErrorAction SilentlyContinue
+  netsh winhttp reset proxy
 }
 
 function Stop-UserTunnelProcesses {
@@ -88,109 +101,80 @@ function Stop-UserTunnelProcesses {
     } |
     ForEach-Object {
       if ($DryRun) {
-        Write-Host "Would stop user tunnel/proxy process: $($_.ProcessName) [$($_.Id)]"
+        Write-Host "Would stop user proxy process: $($_.ProcessName) [$($_.Id)]"
       } else {
-        Write-Host "Stopping user tunnel/proxy process: $($_.ProcessName) [$($_.Id)]"
+        Write-Host "Stopping user proxy process: $($_.ProcessName) [$($_.Id)]"
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
       }
     }
 }
 
 function Remove-TunnelDefaultRoutes {
-  $tunnelAliases = @(Get-TunnelLikeAdapters | Select-Object -ExpandProperty Name)
-
-  if (-not $tunnelAliases -or $tunnelAliases.Count -eq 0) {
-    Write-Host 'No tunnel-like adapters found.'
+  $routes = @(Get-TunnelDefaultRoutes)
+  if (-not $routes -or $routes.Count -eq 0) {
+    Write-Host 'No tunnel default routes found.'
     return
   }
 
-  Get-NetRoute -ErrorAction SilentlyContinue |
-    Where-Object {
-      ($_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0') -and
-      ($tunnelAliases -contains $_.InterfaceAlias)
-    } |
-    ForEach-Object {
-      if ($DryRun) {
-        Write-Host "Would remove tunnel default route only: $($_.DestinationPrefix) via $($_.InterfaceAlias)"
-      } else {
-        Write-Host "Removing tunnel default route only: $($_.DestinationPrefix) via $($_.InterfaceAlias)"
-        Remove-NetRoute -DestinationPrefix $_.DestinationPrefix -InterfaceIndex $_.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
-      }
+  if (-not (Test-IsAdmin)) {
+    Write-Warning 'Tunnel default routes exist, but route cleanup needs administrator permission.'
+    Write-Warning 'Right-click TunnelCleanup.bat and choose Run as administrator to remove them.'
+  }
+
+  foreach ($route in $routes) {
+    if ($DryRun) {
+      Write-Host "Would remove tunnel default route only: $($route.DestinationPrefix) via $($route.InterfaceAlias)"
+    } elseif (Test-IsAdmin) {
+      Write-Host "Removing tunnel default route only: $($route.DestinationPrefix) via $($route.InterfaceAlias)"
+      Remove-NetRoute -DestinationPrefix $route.DestinationPrefix -InterfaceIndex $route.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
     }
-}
-
-function Reset-ProxyState {
-  $proxyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-  $proxyState = Get-ItemProperty -Path $proxyPath |
-    Select-Object ProxyEnable, ProxyServer, ProxyOverride, AutoConfigURL
-  $proxyState | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
-
-  if ($DryRun) {
-    Write-Host "Would disable user proxy at $proxyPath"
-    Write-Host 'Would reset WinHTTP proxy'
-  } else {
-    Set-ItemProperty -Path $proxyPath -Name ProxyEnable -Type DWord -Value 0
-    Set-ItemProperty -Path $proxyPath -Name AutoConfigURL -Value ''
-    netsh winhttp reset proxy
   }
 }
 
 function Restart-PhysicalNetwork {
-  $adapter = Get-PrimaryPhysicalAdapter
+  $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Status -eq 'Up' -and
+      $_.InterfaceDescription -notmatch 'Virtual|Loopback|TAP|TUN|Tunnel|VPN|Wintun|WireGuard|Hyper-V|VirtualBox|VMware'
+    } |
+    Sort-Object InterfaceMetric, InterfaceIndex |
+    Select-Object -First 1
+
   if (-not $adapter) {
-    Write-Warning 'No physical network adapter was found.'
+    Write-Warning 'No active physical network adapter was found.'
     return
   }
 
-  Write-Host "Selected physical adapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
   if ($DryRun) {
     Write-Host "Would restart physical adapter: $($adapter.Name)"
-    Write-Host "Would renew DHCP on adapter: $($adapter.Name)"
-  } else {
-    Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 8
-
-    ipconfig /release $adapter.Name
-    ipconfig /renew $adapter.Name
+    return
   }
 
-  $adapter = Get-NetAdapter -Name $adapter.Name -ErrorAction SilentlyContinue
-  $ipConfig = Get-NetIPConfiguration -InterfaceAlias $adapter.Name -ErrorAction SilentlyContinue
-  $ipv4 = $ipConfig.IPv4Address.IPAddress | Select-Object -First 1
-  $gateway = $ipConfig.IPv4DefaultGateway.NextHop | Select-Object -First 1
+  if (-not (Test-IsAdmin)) {
+    Write-Warning 'Adapter restart needs administrator permission. Skipped.'
+    return
+  }
 
-  Write-Host "Adapter status: $($adapter.Status)"
-  Write-Host "IPv4: $ipv4"
-  Write-Host "Gateway: $gateway"
-  Write-Host "DNS: $($ipConfig.DNSServer.ServerAddresses -join ', ')"
+  Write-Host "Restarting physical adapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
+  Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 3
+  Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+}
 
-  if (-not $NoOpenPortal -and $adapter.Status -eq 'Up' -and $ipv4 -and $gateway) {
-    Write-Step 'Trying to discover a captive portal'
-    $headers = & curl.exe --interface $ipv4 -I --max-time 10 'http://www.msftconnecttest.com/connecttest.txt' 2>&1
-    $headers | ForEach-Object { Write-Host $_ }
-
-    $locationLine = $headers | Where-Object { $_ -match '^\s*Location:\s*(.+)\s*$' } | Select-Object -First 1
-    if ($locationLine -and $locationLine -match '^\s*Location:\s*(.+)\s*$') {
-      $portalUrl = $Matches[1].Trim()
-      Write-Host "Detected captive portal: $portalUrl"
-      if ($DryRun) {
-        Write-Host "Would open captive portal: $portalUrl"
-      } else {
-        Start-Process $portalUrl
-      }
-    } else {
-      Write-Host 'No captive portal redirect was detected.'
-    }
+function Open-CaptivePortalProbe {
+  $url = 'http://www.msftconnecttest.com/redirect'
+  if ($DryRun) {
+    Write-Host "Would open captive portal probe: $url"
+  } else {
+    Start-Process $url
   }
 }
 
 Write-Step 'Saving and resetting proxy state'
 Reset-ProxyState
 
-if (-not $NoStopProcesses) {
-  Write-Step 'Stopping user tunnel/proxy processes'
+if ($StopProcesses -and -not $NoStopProcesses) {
+  Write-Step 'Stopping user proxy processes'
   Stop-UserTunnelProcesses
 } else {
   Write-Step 'Skipping process cleanup'
@@ -199,30 +183,46 @@ if (-not $NoStopProcesses) {
 Write-Step 'Removing default routes owned by tunnel-like adapters'
 Remove-TunnelDefaultRoutes
 
-Write-Step 'Keeping tunnel adapters installed and enabled'
+Write-Step 'Keeping all adapters installed and enabled'
 Get-TunnelLikeAdapters |
   Select-Object Name, InterfaceDescription, Status, InterfaceIndex |
   Format-Table -AutoSize
 
-Write-Step 'Refreshing DNS'
-if ($DryRun) {
-  Write-Host 'Would flush DNS'
+if ($FlushDns) {
+  Write-Step 'Refreshing DNS'
+  if ($DryRun) {
+    Write-Host 'Would flush DNS.'
+  } else {
+    ipconfig /flushdns
+  }
 } else {
-  ipconfig /flushdns
+  Write-Step 'Skipping DNS flush'
 }
 
-if (-not $NoRestartAdapter) {
-  Write-Step 'Restarting primary physical adapter and renewing DHCP'
+if ($RestartAdapter -and -not $NoRestartAdapter) {
+  Write-Step 'Restarting primary physical adapter'
   Restart-PhysicalNetwork
 } else {
   Write-Step 'Skipping adapter restart'
 }
 
-Write-Step 'Final adapter and route state'
-Get-NetAdapter | Sort-Object InterfaceIndex |
-  Select-Object Name, InterfaceDescription, Status, LinkSpeed, InterfaceIndex |
+if ($OpenPortal -and -not $NoOpenPortal) {
+  Write-Step 'Opening captive portal probe'
+  Open-CaptivePortalProbe
+} else {
+  Write-Step 'Skipping captive portal probe'
+}
+
+Write-Step 'Final proxy and route state'
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' |
+  Select-Object ProxyEnable, ProxyServer, AutoConfigURL |
+  Format-List
+netsh winhttp show proxy
+Get-NetRoute -AddressFamily IPv4 |
+  Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } |
+  Sort-Object RouteMetric, InterfaceMetric |
+  Select-Object DestinationPrefix, NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric |
   Format-Table -AutoSize
-route print -4
 
 Write-Host ''
 Write-Host "Log: $log"
