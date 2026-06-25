@@ -4,9 +4,11 @@ param(
   [switch]$FlushDns,
   [switch]$RestartAdapter,
   [switch]$OpenPortal,
+  [switch]$DisableMetaTunnel,
   [switch]$NoStopProcesses,
   [switch]$NoRestartAdapter,
   [switch]$NoOpenPortal,
+  [switch]$NoDisableMetaTunnel,
   [string]$LogDirectory = ''
 )
 
@@ -23,7 +25,7 @@ $stateFile = Join-Path $LogDirectory 'last-proxy-state.json'
 
 Start-Transcript -Path $log -Append | Out-Null
 Write-Host "=== Tunnel cleanup started: $(Get-Date) ==="
-Write-Host 'Mode: gentle cleanup. No adapter restart, no DHCP renew, no DNS flush, no driver changes.'
+Write-Host 'Mode: captive portal cleanup. No driver uninstall, no DHCP renew, no physical adapter restart.'
 if ($DryRun) {
   Write-Host 'Dry run mode: no changes will be made.'
 }
@@ -43,6 +45,14 @@ function Get-TunnelLikeAdapters {
     Where-Object {
       $_.Name -match 'tun|tap|vpn|wireguard|wintun|meta|clash|mihomo|sing|tailscale|zerotier|openvpn' -or
       $_.InterfaceDescription -match 'tun|tap|vpn|wireguard|wintun|tunnel|meta|clash|mihomo|sing|tailscale|zerotier|openvpn'
+    }
+}
+
+function Get-MetaTunnelAdapters {
+  Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Name -match 'meta|clash|mihomo|sing|wintun' -or
+      $_.InterfaceDescription -match 'meta|clash|mihomo|sing|wintun'
     }
 }
 
@@ -131,6 +141,28 @@ function Remove-TunnelDefaultRoutes {
   }
 }
 
+function Disable-MetaTunnelAdapters {
+  $adapters = @(Get-MetaTunnelAdapters | Where-Object { $_.Status -ne 'Disabled' })
+  if (-not $adapters -or $adapters.Count -eq 0) {
+    Write-Host 'No enabled Meta/Clash tunnel adapters found.'
+    return
+  }
+
+  if (-not (Test-IsAdmin)) {
+    Write-Warning 'Disabling Meta/Clash tunnel adapters needs administrator permission.'
+    Write-Warning 'Right-click TunnelCleanup.bat and choose Run as administrator.'
+  }
+
+  foreach ($adapter in $adapters) {
+    if ($DryRun) {
+      Write-Host "Would disable tunnel adapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
+    } elseif (Test-IsAdmin) {
+      Write-Host "Disabling tunnel adapter: $($adapter.Name) [$($adapter.InterfaceDescription)]"
+      Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 function Restart-PhysicalNetwork {
   $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
     Where-Object {
@@ -183,10 +215,20 @@ if ($StopProcesses -and -not $NoStopProcesses) {
 Write-Step 'Removing default routes owned by tunnel-like adapters'
 Remove-TunnelDefaultRoutes
 
-Write-Step 'Keeping all adapters installed and enabled'
+Write-Step 'Tunnel adapters before optional disable'
 Get-TunnelLikeAdapters |
   Select-Object Name, InterfaceDescription, Status, InterfaceIndex |
   Format-Table -AutoSize
+
+if (-not $NoDisableMetaTunnel -and -not $DryRun) {
+  Write-Step 'Disabling Meta/Clash tunnel adapters without uninstalling them'
+  Disable-MetaTunnelAdapters
+} elseif ($DryRun -and -not $NoDisableMetaTunnel) {
+  Write-Step 'Previewing Meta/Clash tunnel adapter disable'
+  Disable-MetaTunnelAdapters
+} else {
+  Write-Step 'Skipping Meta/Clash tunnel adapter disable'
+}
 
 if ($FlushDns) {
   Write-Step 'Refreshing DNS'
